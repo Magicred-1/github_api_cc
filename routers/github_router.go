@@ -1,6 +1,9 @@
 package routers
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -9,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/gofiber/fiber/v2"
@@ -63,13 +67,13 @@ func GetGHAllUserRepos(c *fiber.Ctx) error {
 	}
 
 	// Pass the captured response body to writeCSVfromJSON
-	err = writeCSVfromJSON(responseBody, username, "repos")
+	err = writeCSVfromJSON(responseBody, username, "users")
 	if err != nil {
 		return err
 	}
 
 	// Return the list of repositories as JSON
-	return c.JSON(repos)
+	return c.JSON(res.Body)
 }
 
 func GetGHUserRepo(c *fiber.Ctx) error {
@@ -235,25 +239,163 @@ func DownloadRepoSource(c *fiber.Ctx) error {
 		return c.Status(res.StatusCode).JSON(res.Status)
 	}
 
-	// Create and open a file for writing the downloaded source
-	if _, err := os.Stat("./public/downloads"); os.IsNotExist(err) {
-		os.MkdirAll("./public/downloads", os.ModePerm)
+	// Create a temporary file to store the downloaded gz source
+	tmpFile, err := os.CreateTemp("", "temp*.tar.gz")
+	if err != nil {
+		return err
+	}
+	defer tmpFile.Close()
+
+	// Copy the downloaded gz source to the temporary file
+	_, err = io.Copy(tmpFile, res.Body)
+	if err != nil {
+		return err
 	}
 
-	file, err := os.Create("./public/downloads/" + reponame + ".zip")
+	// Close the temporary file before extracting
+	tmpFile.Close()
+
+	// Create and open a directory to extract the contents
+	extractDir := "./public/downloads/" + reponame
+	if err := os.MkdirAll(extractDir, os.ModePerm); err != nil {
+		return err
+	}
+
+	// Extract the gz source into the directory
+	if err := extractGz(tmpFile.Name(), extractDir); err != nil {
+		return err
+	}
+
+	// Zip the extracted contents
+	zipFileName := "./public/downloads/" + reponame + ".zip"
+	if err := zipDirectory(extractDir, zipFileName); err != nil {
+		return err
+	}
+
+	// Return a success message
+	return c.SendString("Repository source downloaded, extracted, and zipped successfully")
+}
+
+// extractGz extracts a gzipped tarball to a directory
+func extractGz(srcFile, destDir string) error {
+	file, err := os.Open(srcFile)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	// Copy the downloaded source to the file
-	_, err = io.Copy(file, res.Body)
+	err = uncompressGz(file, destDir)
 	if err != nil {
 		return err
 	}
 
-	// Return a success message
-	return c.SendString("Repository source downloaded successfully")
+	return nil
+}
+
+// uncompressGz uncompresses a gzipped stream to a directory
+func uncompressGz(src io.Reader, destDir string) error {
+	gz, err := gzip.NewReader(src)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+
+		path := filepath.Join(destDir, header.Name)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			// Create directory
+			if err := os.MkdirAll(path, os.ModePerm); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			// Create file
+			file, err := os.Create(path)
+			if err != nil {
+				return err
+			}
+
+			// Copy file contents
+			if _, err := io.Copy(file, tr); err != nil {
+				file.Close()
+				return err
+			}
+			file.Close()
+		}
+	}
+
+	return nil
+}
+
+// zipDirectory creates a zip file from a directory
+func zipDirectory(sourceDir, targetZip string) error {
+	zipFile, err := os.Create(targetZip)
+	if err != nil {
+		return err
+	}
+	defer zipFile.Close()
+
+	archive := zip.NewWriter(zipFile)
+	defer archive.Close()
+
+	err = filepath.Walk(sourceDir, func(filePath string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(sourceDir, filePath)
+		if err != nil {
+			return err
+		}
+
+		header.Name = relPath
+
+		if info.IsDir() {
+			header.Name += "/"
+		}
+
+		writer, err := archive.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() {
+			file, err := os.Open(filePath)
+			if err != nil {
+				return err
+			}
+			defer file.Close()
+
+			_, err = io.Copy(writer, file)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func GetDownloadedRepos(c *fiber.Ctx) error {
